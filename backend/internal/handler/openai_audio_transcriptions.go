@@ -89,7 +89,7 @@ func (h *OpenAIGatewayHandler) AudioTranscriptions(c *gin.Context) {
 		return
 	}
 
-	requestPayloadHash := service.HashOpenAIAudioTranscriptionPayload(parsed.Model, parsed.FileBytes, parsed.Prompt)
+	requestPayloadHash := service.HashOpenAIAudioTranscriptionPayload(parsed.Model, parsed.FileBytes, parsed.Prompt, parsed.ExtraFields...)
 	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, []byte(requestPayloadHash))
 	failedAccountIDs := make(map[int64]struct{})
 	var lastFailoverErr *service.UpstreamFailoverError

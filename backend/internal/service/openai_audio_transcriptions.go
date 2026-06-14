@@ -33,12 +33,20 @@ const (
 	maxAudioTranscriptionTextFieldBytes = 64 << 10
 )
 
+var openAIAudioTranscriptionOAuthHeaderPrefixes = [...]string{"x-openai-", "x-codex-"}
+
+type OpenAIAudioTranscriptionFormField struct {
+	Name  string
+	Value string
+}
+
 type OpenAIAudioTranscriptionRequest struct {
 	FileName        string
 	ContentType     string
 	FileBytes       []byte
 	Model           string
 	Prompt          string
+	ExtraFields     []OpenAIAudioTranscriptionFormField
 	DurationSeconds int
 	DurationParsed  bool
 }
@@ -160,14 +168,31 @@ func (s *OpenAIGatewayService) ParseOpenAIAudioTranscriptionRequest(body []byte,
 				return nil, readErr
 			}
 			parsed.Prompt = strings.TrimSpace(value)
+		case "language", "response_format", "temperature", "stream", "chunking_strategy",
+			"include", "include[]",
+			"timestamp_granularities", "timestamp_granularities[]",
+			"known_speaker_names", "known_speaker_names[]",
+			"known_speaker_references", "known_speaker_references[]":
+			if filename != "" {
+				_ = part.Close()
+				return nil, newOpenAIAudioTranscriptionRequestError(http.StatusBadRequest, "invalid_request_error", formName+" must be a form field", formName)
+			}
+			value, readErr := readAudioTranscriptionTextField(part)
+			_ = part.Close()
+			if readErr != nil {
+				return nil, readErr
+			}
+			if value = strings.TrimSpace(value); value != "" {
+				parsed.ExtraFields = append(parsed.ExtraFields, OpenAIAudioTranscriptionFormField{
+					Name:  formName,
+					Value: value,
+				})
+			}
 		case "":
 			_ = part.Close()
 			return nil, newOpenAIAudioTranscriptionRequestError(http.StatusBadRequest, "invalid_request_error", "Multipart field name is required", "")
 		default:
 			_ = part.Close()
-			if formName == "stream" {
-				return nil, newOpenAIAudioTranscriptionRequestError(http.StatusBadRequest, "invalid_request_error", "stream is not supported for audio transcriptions", "stream")
-			}
 			return nil, newOpenAIAudioTranscriptionRequestError(http.StatusBadRequest, "invalid_request_error", "Unsupported audio transcription field: "+formName, formName)
 		}
 	}
@@ -275,7 +300,7 @@ func (s *OpenAIGatewayService) forwardOpenAIAudioTranscriptionAPIKey(
 		return nil, fmt.Errorf("invalid base_url: %w", err)
 	}
 	targetURL := buildOpenAIAudioTranscriptionsURL(validatedURL)
-	body, contentType, err := buildOpenAIAudioTranscriptionMultipart(input, true)
+	body, contentType, err := buildOpenAIAudioTranscriptionMultipart(input, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +328,7 @@ func (s *OpenAIGatewayService) forwardOpenAIAudioTranscriptionOAuth(
 	if err != nil {
 		return nil, err
 	}
-	body, contentType, err := buildOpenAIAudioTranscriptionMultipart(input, false)
+	body, contentType, err := buildOpenAIAudioTranscriptionMultipart(input, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -313,17 +338,64 @@ func (s *OpenAIGatewayService) forwardOpenAIAudioTranscriptionOAuth(
 	}
 	req.Host = "chatgpt.com"
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
 	if chatgptAccountID := strings.TrimSpace(account.GetChatGPTAccountID()); chatgptAccountID != "" {
 		req.Header.Set("chatgpt-account-id", chatgptAccountID)
 	}
-	if customUA := account.GetOpenAIUserAgent(); customUA != "" {
-		req.Header.Set("User-Agent", customUA)
-	}
-	if req.Header.Get("User-Agent") == "" || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI) {
-		req.Header.Set("User-Agent", codexCLIUserAgent)
-	}
+	applyOpenAIAudioTranscriptionOAuthClientHeaders(req, c)
 	return s.forwardOpenAIAudioTranscriptionHTTP(ctx, c, account, req, input, chatgptAudioTranscriptionEndpoint)
+}
+
+func applyOpenAIAudioTranscriptionOAuthClientHeaders(req *http.Request, c *gin.Context) {
+	if req == nil {
+		return
+	}
+	copiedUserAgent := false
+	if c != nil && c.Request != nil {
+		for key, values := range c.Request.Header {
+			lowerKey := strings.ToLower(key)
+			if lowerKey == "user-agent" {
+				if setOpenAIAudioTranscriptionFirstNonEmptyHeader(req.Header, key, values) {
+					copiedUserAgent = true
+				}
+				continue
+			}
+			if hasOpenAIAudioTranscriptionHeaderPrefix(lowerKey, openAIAudioTranscriptionOAuthHeaderPrefixes[:]) {
+				addOpenAIAudioTranscriptionNonEmptyHeaders(req.Header, key, values)
+			}
+		}
+	}
+	if !copiedUserAgent {
+		req.Header.Set("User-Agent", "")
+	}
+}
+
+func setOpenAIAudioTranscriptionFirstNonEmptyHeader(header http.Header, key string, values []string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		header.Set(key, value)
+		return true
+	}
+	return false
+}
+
+func addOpenAIAudioTranscriptionNonEmptyHeaders(header http.Header, key string, values []string) {
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		header.Add(key, value)
+	}
+}
+
+func hasOpenAIAudioTranscriptionHeaderPrefix(value string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(value, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *OpenAIGatewayService) buildOpenAIAudioTranscriptionHTTPRequest(ctx context.Context, targetURL string, body []byte, contentType string) (*http.Request, error) {
@@ -401,8 +473,17 @@ func (s *OpenAIGatewayService) forwardOpenAIAudioTranscriptionHTTP(
 	if err != nil {
 		return nil, err
 	}
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = "application/json"
+	}
 	textResult := gjson.GetBytes(respBody, "text")
-	if !textResult.Exists() || textResult.Type != gjson.String {
+	text := ""
+	if textResult.Exists() && textResult.Type == gjson.String {
+		text = textResult.String()
+	} else if shouldAcceptRawAudioTranscriptionBody(input, contentType) {
+		text = string(respBody)
+	} else {
 		return nil, fmt.Errorf("audio transcription upstream returned invalid response")
 	}
 	usage, _ := extractOpenAIUsageFromJSONBytes(respBody)
@@ -422,10 +503,6 @@ func (s *OpenAIGatewayService) forwardOpenAIAudioTranscriptionHTTP(
 		result.BillableDurationSeconds = input.DurationSeconds
 	}
 
-	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if contentType == "" {
-		contentType = "application/json"
-	}
 	logger.L().Debug("openai audio transcription: upstream succeeded",
 		zap.Int64("account_id", account.ID),
 		zap.String("upstream_endpoint", upstreamEndpoint),
@@ -435,14 +512,14 @@ func (s *OpenAIGatewayService) forwardOpenAIAudioTranscriptionHTTP(
 	return &OpenAIAudioTranscriptionOutput{
 		Result:      result,
 		Body:        respBody,
-		Text:        textResult.String(),
+		Text:        text,
 		StatusCode:  resp.StatusCode,
 		Header:      resp.Header.Clone(),
 		ContentType: contentType,
 	}, nil
 }
 
-func buildOpenAIAudioTranscriptionMultipart(input *OpenAIAudioTranscriptionRequest, includeModel bool) ([]byte, string, error) {
+func buildOpenAIAudioTranscriptionMultipart(input *OpenAIAudioTranscriptionRequest, includeModel bool, includeExtraFields bool) ([]byte, string, error) {
 	if input == nil {
 		return nil, "", fmt.Errorf("audio transcription request is required")
 	}
@@ -476,6 +553,18 @@ func buildOpenAIAudioTranscriptionMultipart(input *OpenAIAudioTranscriptionReque
 			return nil, "", err
 		}
 	}
+	if includeExtraFields {
+		for _, field := range input.ExtraFields {
+			name := strings.TrimSpace(field.Name)
+			value := strings.TrimSpace(field.Value)
+			if name == "" || value == "" {
+				continue
+			}
+			if err := writer.WriteField(name, value); err != nil {
+				return nil, "", err
+			}
+		}
+	}
 	if err := writer.Close(); err != nil {
 		return nil, "", err
 	}
@@ -492,15 +581,52 @@ func buildOpenAIAudioTranscriptionsURL(base string) string {
 	return buildOpenAIEndpointURL(base, openAIAudioTranscriptionsEndpoint)
 }
 
-func HashOpenAIAudioTranscriptionPayload(model string, fileBytes []byte, prompt string) string {
+func HashOpenAIAudioTranscriptionPayload(model string, fileBytes []byte, prompt string, fields ...OpenAIAudioTranscriptionFormField) string {
 	hash := sha256.New()
-	hash.Write([]byte(strings.TrimSpace(model)))
-	hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(strings.TrimSpace(model)))
+	_, _ = hash.Write([]byte{0})
 	fileHash := sha256.Sum256(fileBytes)
-	hash.Write([]byte(hex.EncodeToString(fileHash[:])))
-	hash.Write([]byte{0})
-	hash.Write([]byte(strings.TrimSpace(prompt)))
+	_, _ = hash.Write([]byte(hex.EncodeToString(fileHash[:])))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(strings.TrimSpace(prompt)))
+	for _, field := range fields {
+		name := strings.TrimSpace(field.Name)
+		value := strings.TrimSpace(field.Value)
+		if name == "" || value == "" {
+			continue
+		}
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(name))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(value))
+	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func shouldAcceptRawAudioTranscriptionBody(input *OpenAIAudioTranscriptionRequest, contentType string) bool {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	if contentType != "" && !strings.Contains(contentType, "json") {
+		return true
+	}
+	if input == nil {
+		return false
+	}
+	for _, field := range input.ExtraFields {
+		name := strings.TrimSpace(field.Name)
+		value := strings.ToLower(strings.TrimSpace(field.Value))
+		switch name {
+		case "stream":
+			if value == "true" || value == "1" {
+				return true
+			}
+		case "response_format":
+			switch value {
+			case "text", "srt", "vtt":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func OpenAIUsageHasBillableTokens(usage OpenAIUsage) bool {

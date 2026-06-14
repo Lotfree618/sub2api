@@ -65,7 +65,7 @@ func TestParseOpenAIAudioTranscriptionRequestValidatesStrictFields(t *testing.T)
 	require.Equal(t, []byte("RIFF....WAVEfmt "), parsed.FileBytes)
 }
 
-func TestParseOpenAIAudioTranscriptionRequestRejectsUnsupportedModelAndStream(t *testing.T) {
+func TestParseOpenAIAudioTranscriptionRequestRejectsUnsupportedModel(t *testing.T) {
 	tests := []struct {
 		name      string
 		fields    map[string]string
@@ -75,16 +75,6 @@ func TestParseOpenAIAudioTranscriptionRequestRejectsUnsupportedModelAndStream(t 
 			name:      "unsupported model",
 			fields:    map[string]string{"model": "gpt-4o-mini-transcribe"},
 			wantParam: "model",
-		},
-		{
-			name:      "stream field",
-			fields:    map[string]string{"model": OpenAIAudioTranscriptionModel, "stream": "true"},
-			wantParam: "stream",
-		},
-		{
-			name:      "language field",
-			fields:    map[string]string{"model": OpenAIAudioTranscriptionModel, "language": "zh"},
-			wantParam: "language",
 		},
 	}
 
@@ -101,6 +91,29 @@ func TestParseOpenAIAudioTranscriptionRequestRejectsUnsupportedModelAndStream(t 
 			require.Equal(t, tt.wantParam, reqErr.Param)
 		})
 	}
+}
+
+func TestParseOpenAIAudioTranscriptionRequestAcceptsOfficialOptionalFields(t *testing.T) {
+	body, contentType := buildAudioTranscriptionTestMultipart(t, map[string]string{
+		"model":                      OpenAIAudioTranscriptionModel,
+		"language":                   "en",
+		"response_format":            "json",
+		"temperature":                "0",
+		"stream":                     "false",
+		"include[]":                  "logprobs",
+		"timestamp_granularities[]":  "segment",
+		"chunking_strategy":          "auto",
+		"known_speaker_names[]":      "agent",
+		"known_speaker_references[]": "data:audio/wav;base64,AAA",
+	}, []byte("audio bytes"))
+
+	parsed, err := (&OpenAIGatewayService{}).ParseOpenAIAudioTranscriptionRequest(body, contentType)
+
+	require.NoError(t, err)
+	require.Contains(t, parsed.ExtraFields, OpenAIAudioTranscriptionFormField{Name: "language", Value: "en"})
+	require.Contains(t, parsed.ExtraFields, OpenAIAudioTranscriptionFormField{Name: "response_format", Value: "json"})
+	require.Contains(t, parsed.ExtraFields, OpenAIAudioTranscriptionFormField{Name: "include[]", Value: "logprobs"})
+	require.Contains(t, parsed.ExtraFields, OpenAIAudioTranscriptionFormField{Name: "known_speaker_names[]", Value: "agent"})
 }
 
 func TestParseOpenAIAudioTranscriptionRequestRejectsMissingFileOrModel(t *testing.T) {
@@ -154,6 +167,11 @@ func TestForwardAudioTranscriptionAPIKeyIncludesModelPromptAndUsesOfficialEndpoi
 		FileBytes:   []byte("audio bytes"),
 		Model:       OpenAIAudioTranscriptionModel,
 		Prompt:      "hint",
+		ExtraFields: []OpenAIAudioTranscriptionFormField{
+			{Name: "language", Value: "en"},
+			{Name: "response_format", Value: "json"},
+			{Name: "include[]", Value: "logprobs"},
+		},
 	})
 
 	require.NoError(t, err)
@@ -164,16 +182,61 @@ func TestForwardAudioTranscriptionAPIKeyIncludesModelPromptAndUsesOfficialEndpoi
 	parts := readAudioTranscriptionMultipartParts(t, upstream.lastReq.Header.Get("Content-Type"), upstream.lastBody)
 	require.Equal(t, OpenAIAudioTranscriptionModel, parts["model"])
 	require.Equal(t, "hint", parts["prompt"])
+	require.Equal(t, "en", parts["language"])
+	require.Equal(t, "json", parts["response_format"])
+	require.Equal(t, "logprobs", parts["include[]"])
 	require.Equal(t, "audio bytes", parts["file"])
 	require.True(t, OpenAIUsageHasBillableTokens(output.Result.Usage))
 	require.Zero(t, output.Result.BillableDurationSeconds)
 }
 
-func TestForwardAudioTranscriptionOAuthOmitsModelAndClientHeaders(t *testing.T) {
+func TestForwardAudioTranscriptionAPIKeyAcceptsTextResponseFormat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c := newAudioTranscriptionGinContext(t)
+	upstream := &audioTranscriptionHTTPUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       io.NopCloser(strings.NewReader("hello from text response")),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID:       13,
+		Type:     AccountTypeAPIKey,
+		Platform: PlatformOpenAI,
+		Credentials: map[string]any{
+			"api_key": "sk-upstream",
+		},
+	}
+
+	output, err := svc.ForwardAudioTranscription(context.Background(), c, account, &OpenAIAudioTranscriptionRequest{
+		FileName:        "voice.wav",
+		ContentType:     "audio/wav",
+		FileBytes:       []byte("audio bytes"),
+		Model:           OpenAIAudioTranscriptionModel,
+		DurationParsed:  true,
+		DurationSeconds: 4,
+		ExtraFields: []OpenAIAudioTranscriptionFormField{
+			{Name: "response_format", Value: "text"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "hello from text response", output.Text)
+	require.Equal(t, []byte("hello from text response"), output.Body)
+	require.Equal(t, "text/plain", output.ContentType)
+	require.Equal(t, 4, output.Result.BillableDurationSeconds)
+	parts := readAudioTranscriptionMultipartParts(t, upstream.lastReq.Header.Get("Content-Type"), upstream.lastBody)
+	require.Equal(t, "text", parts["response_format"])
+}
+
+func TestForwardAudioTranscriptionOAuthUsesMinimalUpstreamHeaderFingerprint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c := newAudioTranscriptionGinContext(t)
 	c.Request.Header.Set("Authorization", "Bearer client-key")
+	c.Request.Header.Set("Accept", "text/plain")
+	c.Request.Header.Set("x-request-id", "client-request-id")
 	c.Request.Header.Set("x-codex-turn-state", "client-controlled")
+	c.Request.Header.Set("x-openai-client-version", "1.2.3")
 	upstream := &audioTranscriptionHTTPUpstream{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -187,16 +250,20 @@ func TestForwardAudioTranscriptionOAuthOmitsModelAndClientHeaders(t *testing.T) 
 		Credentials: map[string]any{
 			"access_token":       "oauth-token",
 			"chatgpt_account_id": "chatgpt-acc",
-			"user_agent":         "Codex-Test-UA/1.0",
+			"user_agent":         "Ignored-Account-UA/1.0",
 		},
 	}
 
 	output, err := svc.ForwardAudioTranscription(context.Background(), c, account, &OpenAIAudioTranscriptionRequest{
-		FileName:        "voice.wav",
-		ContentType:     "audio/wav",
-		FileBytes:       []byte("audio bytes"),
-		Model:           OpenAIAudioTranscriptionModel,
-		Prompt:          "hint",
+		FileName:    "voice.wav",
+		ContentType: "audio/wav",
+		FileBytes:   []byte("audio bytes"),
+		Model:       OpenAIAudioTranscriptionModel,
+		Prompt:      "hint",
+		ExtraFields: []OpenAIAudioTranscriptionFormField{
+			{Name: "language", Value: "en"},
+			{Name: "response_format", Value: "json"},
+		},
 		DurationParsed:  true,
 		DurationSeconds: 7,
 	})
@@ -207,10 +274,15 @@ func TestForwardAudioTranscriptionOAuthOmitsModelAndClientHeaders(t *testing.T) 
 	require.Equal(t, "chatgpt.com", upstream.lastReq.Host)
 	require.Equal(t, "Bearer oauth-token", upstream.lastReq.Header.Get("Authorization"))
 	require.Equal(t, "chatgpt-acc", upstream.lastReq.Header.Get("chatgpt-account-id"))
-	require.Equal(t, "Codex-Test-UA/1.0", upstream.lastReq.Header.Get("User-Agent"))
-	require.Empty(t, upstream.lastReq.Header.Get("x-codex-turn-state"))
+	require.Equal(t, "OpenAI-Go-Test/1.0", upstream.lastReq.Header.Get("User-Agent"))
+	require.Equal(t, "client-controlled", upstream.lastReq.Header.Get("x-codex-turn-state"))
+	require.Equal(t, "1.2.3", upstream.lastReq.Header.Get("x-openai-client-version"))
+	require.Empty(t, upstream.lastReq.Header.Get("Accept"))
+	require.Empty(t, upstream.lastReq.Header.Get("x-request-id"))
 	parts := readAudioTranscriptionMultipartParts(t, upstream.lastReq.Header.Get("Content-Type"), upstream.lastBody)
 	require.NotContains(t, parts, "model")
+	require.NotContains(t, parts, "language")
+	require.NotContains(t, parts, "response_format")
 	require.Equal(t, "hint", parts["prompt"])
 	require.Equal(t, "audio bytes", parts["file"])
 	require.Equal(t, 7, output.Result.BillableDurationSeconds)
