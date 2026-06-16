@@ -1246,6 +1246,7 @@ export interface UsageLog {
 
   // 图片生成字段
   image_count: number
+  billable_duration_seconds: number
   image_size: string | null
   image_input_size: string | null
   image_output_size: string | null

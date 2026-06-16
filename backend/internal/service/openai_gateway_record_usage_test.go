@@ -1270,6 +1270,85 @@ func TestOpenAIGatewayServiceRecordUsage_UnpricedTokenModelFallsBackToZeroCostUs
 	require.Equal(t, 0, subRepo.incrementCalls)
 }
 
+func TestOpenAIGatewayServiceRecordUsage_AudioDurationUsesDefaultPricing(t *testing.T) {
+	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+	billingRepo := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
+	userRepo := &openAIRecordUsageUserRepoStub{}
+	subRepo := &openAIRecordUsageSubRepoStub{}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(usageRepo, billingRepo, userRepo, subRepo, nil)
+
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID:               "resp_audio_duration",
+			Model:                   OpenAIAudioTranscriptionModel,
+			BillingModel:            OpenAIAudioTranscriptionModel,
+			UpstreamModel:           OpenAIAudioTranscriptionModel,
+			BillableDurationSeconds: 3,
+			Duration:                time.Second,
+		},
+		APIKey: &APIKey{
+			ID:    10080,
+			Group: &Group{RateMultiplier: 1},
+		},
+		User:    &User{ID: 20080},
+		Account: &Account{ID: 30080, Type: AccountTypeOAuth},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, billingRepo.calls)
+	require.Equal(t, 1, usageRepo.calls)
+	require.NotNil(t, usageRepo.lastLog)
+	require.Equal(t, 3, usageRepo.lastLog.BillableDurationSeconds)
+	require.NotNil(t, usageRepo.lastLog.BillingMode)
+	require.Equal(t, string(BillingModeDuration), *usageRepo.lastLog.BillingMode)
+	require.InDelta(t, 0.0003, usageRepo.lastLog.TotalCost, 1e-12)
+	require.InDelta(t, 0.00033, usageRepo.lastLog.ActualCost, 1e-12)
+	require.NotNil(t, billingRepo.lastCmd)
+	require.InDelta(t, 0.00033, billingRepo.lastCmd.BalanceCost, 1e-12)
+	require.Equal(t, 3, billingRepo.lastCmd.BillableDurationSeconds)
+	require.Equal(t, string(MediaTypeAudioTranscription), billingRepo.lastCmd.MediaType)
+}
+
+func TestOpenAIGatewayServiceRecordUsage_AudioDurationUsesChannelOverride(t *testing.T) {
+	groupID := int64(9003)
+	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
+	billingRepo := &openAIRecordUsageBillingRepoStub{result: &UsageBillingApplyResult{Applied: true}}
+	userRepo := &openAIRecordUsageUserRepoStub{}
+	subRepo := &openAIRecordUsageSubRepoStub{}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(usageRepo, billingRepo, userRepo, subRepo, nil)
+	svc.resolver = newOpenAIDurationChannelPricingResolverForTest(t, groupID, OpenAIAudioTranscriptionModel, 0.0002)
+
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID:               "resp_audio_duration_channel",
+			Model:                   OpenAIAudioTranscriptionModel,
+			BillingModel:            OpenAIAudioTranscriptionModel,
+			UpstreamModel:           OpenAIAudioTranscriptionModel,
+			BillableDurationSeconds: 5,
+			Duration:                time.Second,
+		},
+		APIKey: &APIKey{
+			ID:      10081,
+			GroupID: i64p(groupID),
+			Group:   &Group{ID: groupID, RateMultiplier: 1.1},
+		},
+		User:    &User{ID: 20081},
+		Account: &Account{ID: 30081, Type: AccountTypeOAuth},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, billingRepo.calls)
+	require.NotNil(t, usageRepo.lastLog)
+	require.Equal(t, 5, usageRepo.lastLog.BillableDurationSeconds)
+	require.NotNil(t, usageRepo.lastLog.BillingMode)
+	require.Equal(t, string(BillingModeDuration), *usageRepo.lastLog.BillingMode)
+	require.InDelta(t, 0.001, usageRepo.lastLog.TotalCost, 1e-12)
+	require.NotNil(t, billingRepo.lastCmd)
+	require.InDelta(t, 0.0011, billingRepo.lastCmd.BalanceCost, 1e-12)
+	require.Equal(t, 5, billingRepo.lastCmd.BillableDurationSeconds)
+	require.Equal(t, string(MediaTypeAudioTranscription), billingRepo.lastCmd.MediaType)
+}
+
 func TestOpenAIGatewayServiceRecordUsage_SubscriptionBillingSetsSubscriptionFields(t *testing.T) {
 	usageRepo := &openAIRecordUsageLogRepoStub{inserted: true}
 	userRepo := &openAIRecordUsageUserRepoStub{}
@@ -1688,6 +1767,21 @@ func newOpenAIImageChannelPricingResolverForTest(t *testing.T, groupID int64, mo
 	cache := newEmptyChannelCache()
 	cache.pricingByGroupModel[channelModelKey{groupID: groupID, model: model}] = &ChannelModelPricing{
 		BillingMode:     BillingModeImage,
+		PerRequestPrice: &price,
+	}
+	cache.channelByGroupID[groupID] = &Channel{ID: groupID, Status: StatusActive}
+	cache.groupPlatform[groupID] = ""
+	cache.loadedAt = time.Now()
+	cs := &ChannelService{}
+	cs.cache.Store(cache)
+	return NewModelPricingResolver(cs, NewBillingService(&config.Config{}, nil))
+}
+
+func newOpenAIDurationChannelPricingResolverForTest(t *testing.T, groupID int64, model string, price float64) *ModelPricingResolver {
+	t.Helper()
+	cache := newEmptyChannelCache()
+	cache.pricingByGroupModel[channelModelKey{groupID: groupID, model: model}] = &ChannelModelPricing{
+		BillingMode:     BillingModeDuration,
 		PerRequestPrice: &price,
 	}
 	cache.channelByGroupID[groupID] = &Channel{ID: groupID, Status: StatusActive}

@@ -467,16 +467,17 @@ type UsageLog struct {
 	DurationMs   *int   `json:"duration_ms"`
 	FirstTokenMs *int   `json:"first_token_ms"`
 
-	// 图片生成字段
-	ImageCount         int            `json:"image_count"`
-	ImageSize          *string        `json:"image_size"`
-	ImageInputSize     *string        `json:"image_input_size"`
-	ImageOutputSize    *string        `json:"image_output_size"`
-	ImageOutputTokens  int            `json:"image_output_tokens"`
-	ImageOutputCost    float64        `json:"image_output_cost"`
-	ImageSizeSource    *string        `json:"image_size_source"`
-	ImageSizeBreakdown map[string]int `json:"image_size_breakdown"`
-	MediaType          *string        `json:"media_type"`
+	// 图片生成 / 音频转写字段
+	ImageCount              int            `json:"image_count"`
+	BillableDurationSeconds int            `json:"billable_duration_seconds"`
+	ImageSize               *string        `json:"image_size"`
+	ImageInputSize          *string        `json:"image_input_size"`
+	ImageOutputSize         *string        `json:"image_output_size"`
+	ImageOutputTokens       int            `json:"image_output_tokens"`
+	ImageOutputCost         float64        `json:"image_output_cost"`
+	ImageSizeSource         *string        `json:"image_size_source"`
+	ImageSizeBreakdown      map[string]int `json:"image_size_breakdown"`
+	MediaType               *string        `json:"media_type"`
 
 	// User-Agent
 	UserAgent *string `json:"user_agent"`
@@ -484,7 +485,7 @@ type UsageLog struct {
 	// Cache TTL Override 标记
 	CacheTTLOverridden bool `json:"cache_ttl_overridden"`
 
-	// BillingMode 计费模式：token/image
+	// BillingMode 计费模式：token/image/duration
 	BillingMode *string `json:"billing_mode,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`

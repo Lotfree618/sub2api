@@ -189,6 +189,18 @@
           </div>
         </div>
 
+        <!-- Duration mode -->
+        <div v-else-if="entry.billing_mode === 'duration'">
+          <label class="mt-3 block text-xs font-medium text-gray-500 dark:text-gray-400">
+            {{ t('admin.channels.form.defaultDurationPrice', '默认每秒价格') }}
+            <span class="ml-1 font-normal text-gray-400">$ / second</span>
+          </label>
+          <div class="mt-1 w-48">
+            <input :value="entry.per_request_price" @input="emitField('per_request_price', ($event.target as HTMLInputElement).value)"
+              type="number" step="any" min="0" class="input text-sm" :placeholder="t('admin.channels.form.pricePlaceholder', '默认')" />
+          </div>
+        </div>
+
         <!-- Image mode -->
         <div v-else-if="entry.billing_mode === 'image'">
           <!-- Default image price (per-request, same as per_request mode) -->
@@ -256,7 +268,8 @@ const collapsed = ref(props.entry.models.length > 0)
 const billingModeOptions = computed(() => [
   { value: 'token', label: 'Token' },
   { value: 'per_request', label: t('admin.channels.billingMode.perRequest', '按次') },
-  { value: 'image', label: t('admin.channels.billingMode.image', '图片（按次）') }
+  { value: 'image', label: t('admin.channels.billingMode.image', '图片（按次）') },
+  { value: 'duration', label: t('admin.channels.billingMode.duration', '按秒') }
 ])
 
 const billingModeLabel = computed(() => {

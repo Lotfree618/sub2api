@@ -12,7 +12,9 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,7 +40,8 @@ import (
 
 const (
 	// ChatGPT internal API for OAuth accounts
-	chatgptCodexURL = "https://chatgpt.com/backend-api/codex/responses"
+	chatgptCodexURL      = "https://chatgpt.com/backend-api/codex/responses"
+	chatgptTranscribeURL = "https://chatgpt.com/backend-api/transcribe"
 	// OpenAI Platform API for API Key accounts (fallback)
 	openaiPlatformAPIURL   = "https://api.openai.com/v1/responses"
 	openaiStickySessionTTL = time.Hour // 粘性会话TTL
@@ -237,20 +240,21 @@ type OpenAIForwardResult struct {
 	ServiceTier *string
 	// ReasoningEffort is extracted from request body (reasoning.effort) or derived from model suffix.
 	// Stored for usage records display; nil means not provided / not applicable.
-	ReasoningEffort    *string
-	Stream             bool
-	OpenAIWSMode       bool
-	ResponseHeaders    http.Header
-	Duration           time.Duration
-	FirstTokenMs       *int
-	ClientDisconnect   bool
-	ImageCount         int
-	ImageSize          string
-	ImageInputSize     string
-	ImageOutputSize    string
-	ImageOutputSizes   []string
-	ImageSizeSource    string
-	ImageSizeBreakdown map[string]int
+	ReasoningEffort         *string
+	Stream                  bool
+	OpenAIWSMode            bool
+	ResponseHeaders         http.Header
+	Duration                time.Duration
+	FirstTokenMs            *int
+	ClientDisconnect        bool
+	ImageCount              int
+	BillableDurationSeconds int
+	ImageSize               string
+	ImageInputSize          string
+	ImageOutputSize         string
+	ImageOutputSizes        []string
+	ImageSizeSource         string
+	ImageSizeBreakdown      map[string]int
 
 	wsReplayInput       []json.RawMessage
 	wsReplayInputExists bool
@@ -2336,6 +2340,153 @@ func marshalOpenAIUpstreamJSON(v any) ([]byte, error) {
 		out = out[:len(out)-1]
 	}
 	return out, nil
+}
+
+type OpenAIAudioTranscriptionInput struct {
+	RequestID   string
+	FileName    string
+	ContentType string
+	FileBytes   []byte
+	Prompt      string
+	Model       string
+}
+
+type OpenAIAudioTranscriptionOutput struct {
+	Result *OpenAIForwardResult
+	Body   []byte
+	Text   string
+}
+
+func (s *OpenAIGatewayService) ForwardAudioTranscription(ctx context.Context, c *gin.Context, account *Account, input OpenAIAudioTranscriptionInput) (*OpenAIAudioTranscriptionOutput, error) {
+	if s == nil || s.httpUpstream == nil {
+		return nil, fmt.Errorf("openai gateway service is not configured")
+	}
+	if account == nil || !account.IsOpenAIOAuth() {
+		return nil, fmt.Errorf("audio transcription requires an OpenAI OAuth account")
+	}
+	if len(input.FileBytes) == 0 {
+		return nil, fmt.Errorf("audio file is required")
+	}
+	model := strings.TrimSpace(input.Model)
+	if model == "" {
+		model = OpenAIAudioTranscriptionModel
+	}
+	token, _, err := s.GetAccessToken(ctx, account)
+	if err != nil {
+		return nil, err
+	}
+	body, contentType, err := buildOpenAIAudioTranscriptionMultipart(input)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatgptTranscribeURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
+	req.Host = "chatgpt.com"
+	req.Header.Set("authorization", "Bearer "+token)
+	req.Header.Set("content-type", contentType)
+	if chatgptAccountID := account.GetChatGPTAccountID(); chatgptAccountID != "" {
+		req.Header.Set("chatgpt-account-id", chatgptAccountID)
+	}
+	customUA := account.GetOpenAIUserAgent()
+	if customUA != "" {
+		req.Header.Set("user-agent", customUA)
+	}
+	if req.Header.Get("user-agent") == "" || (s.cfg != nil && s.cfg.Gateway.ForceCodexCLI) {
+		req.Header.Set("user-agent", codexCLIUserAgent)
+	}
+
+	start := time.Now()
+	resp, err := s.httpUpstream.Do(req, resolveAccountProxyURL(account), account.ID, account.Concurrency)
+	if err != nil {
+		safeErr := sanitizeUpstreamErrorMessage(err.Error())
+		setOpsUpstreamError(c, 0, safeErr, "")
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: 0,
+			Kind:               "request_error",
+			Message:            safeErr,
+		})
+		return nil, &UpstreamFailoverError{
+			StatusCode:             http.StatusBadGateway,
+			ResponseBody:           []byte(safeErr),
+			RetryableOnSameAccount: account.IsPoolMode(),
+		}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody := s.readUpstreamErrorBody(resp)
+		s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, model)
+		return nil, &UpstreamFailoverError{StatusCode: resp.StatusCode, ResponseBody: respBody, ResponseHeaders: resp.Header}
+	}
+	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	if err != nil {
+		return nil, err
+	}
+	usage, _ := extractOpenAIUsageFromJSONBytes(respBody)
+	text := strings.TrimSpace(gjson.GetBytes(respBody, "text").String())
+	if text == "" {
+		return nil, fmt.Errorf("audio transcription upstream returned invalid response")
+	}
+	result := &OpenAIForwardResult{
+		RequestID:       firstNonEmptyString(resp.Header.Get("x-request-id"), strings.TrimSpace(input.RequestID)),
+		ResponseID:      extractOpenAIResponseIDFromJSONBytes(respBody),
+		Usage:           usage,
+		Model:           model,
+		BillingModel:    model,
+		UpstreamModel:   model,
+		Stream:          false,
+		OpenAIWSMode:    false,
+		ResponseHeaders: resp.Header.Clone(),
+		Duration:        time.Since(start),
+	}
+	return &OpenAIAudioTranscriptionOutput{
+		Result: result,
+		Body:   respBody,
+		Text:   text,
+	}, nil
+}
+
+func buildOpenAIAudioTranscriptionMultipart(input OpenAIAudioTranscriptionInput) ([]byte, string, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	filename := strings.TrimSpace(input.FileName)
+	if filename == "" {
+		filename = "audio.wav"
+	}
+	contentType := strings.TrimSpace(input.ContentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	partHeader := textproto.MIMEHeader{}
+	partHeader.Set("Content-Disposition", `form-data; name="file"; filename="`+escapeMultipartQuotedString(filename)+`"`)
+	partHeader.Set("Content-Type", contentType)
+	part, err := writer.CreatePart(partHeader)
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := part.Write(input.FileBytes); err != nil {
+		return nil, "", err
+	}
+	if prompt := strings.TrimSpace(input.Prompt); prompt != "" {
+		if err := writer.WriteField("prompt", prompt); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return nil, "", err
+	}
+	return body.Bytes(), writer.FormDataContentType(), nil
+}
+
+func escapeMultipartQuotedString(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `"`, `\"`)
+	return value
 }
 
 func openAIUpstreamErrorBodyReadLimitForConfig(cfg *config.Config) int64 {
@@ -5808,6 +5959,9 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	}
 	cost, err = s.calculateOpenAIRecordUsageCost(ctx, result, apiKey, billingModels, multiplier, imageMultiplier, tokens, serviceTier)
 	if err != nil {
+		if result.BillableDurationSeconds > 0 {
+			return err
+		}
 		if !isUsagePricingUnavailableError(err) {
 			return err
 		}
@@ -5847,28 +6001,33 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	}
 
 	usageLog := &UsageLog{
-		UserID:              user.ID,
-		APIKeyID:            apiKey.ID,
-		AccountID:           account.ID,
-		RequestID:           requestID,
-		Model:               result.Model,
-		RequestedModel:      requestedModel,
-		UpstreamModel:       optionalNonEqualStringPtr(result.UpstreamModel, result.Model),
-		ServiceTier:         result.ServiceTier,
-		ReasoningEffort:     result.ReasoningEffort,
-		InboundEndpoint:     optionalTrimmedStringPtr(input.InboundEndpoint),
-		UpstreamEndpoint:    optionalTrimmedStringPtr(input.UpstreamEndpoint),
-		InputTokens:         actualInputTokens,
-		OutputTokens:        result.Usage.OutputTokens,
-		CacheCreationTokens: result.Usage.CacheCreationInputTokens,
-		CacheReadTokens:     result.Usage.CacheReadInputTokens,
-		ImageOutputTokens:   result.Usage.ImageOutputTokens,
-		ImageCount:          result.ImageCount,
-		ImageSize:           optionalTrimmedStringPtr(result.ImageSize),
-		ImageInputSize:      optionalTrimmedStringPtr(result.ImageInputSize),
-		ImageOutputSize:     optionalTrimmedStringPtr(result.ImageOutputSize),
-		ImageSizeSource:     optionalTrimmedStringPtr(result.ImageSizeSource),
-		ImageSizeBreakdown:  result.ImageSizeBreakdown,
+		UserID:                  user.ID,
+		APIKeyID:                apiKey.ID,
+		AccountID:               account.ID,
+		RequestID:               requestID,
+		Model:                   result.Model,
+		RequestedModel:          requestedModel,
+		UpstreamModel:           optionalNonEqualStringPtr(result.UpstreamModel, result.Model),
+		ServiceTier:             result.ServiceTier,
+		ReasoningEffort:         result.ReasoningEffort,
+		InboundEndpoint:         optionalTrimmedStringPtr(input.InboundEndpoint),
+		UpstreamEndpoint:        optionalTrimmedStringPtr(input.UpstreamEndpoint),
+		InputTokens:             actualInputTokens,
+		OutputTokens:            result.Usage.OutputTokens,
+		CacheCreationTokens:     result.Usage.CacheCreationInputTokens,
+		CacheReadTokens:         result.Usage.CacheReadInputTokens,
+		ImageOutputTokens:       result.Usage.ImageOutputTokens,
+		ImageCount:              result.ImageCount,
+		BillableDurationSeconds: result.BillableDurationSeconds,
+		ImageSize:               optionalTrimmedStringPtr(result.ImageSize),
+		ImageInputSize:          optionalTrimmedStringPtr(result.ImageInputSize),
+		ImageOutputSize:         optionalTrimmedStringPtr(result.ImageOutputSize),
+		ImageSizeSource:         optionalTrimmedStringPtr(result.ImageSizeSource),
+		ImageSizeBreakdown:      result.ImageSizeBreakdown,
+	}
+	if result.BillableDurationSeconds > 0 {
+		mediaType := MediaTypeAudioTranscription
+		usageLog.MediaType = &mediaType
 	}
 	if cost != nil {
 		usageLog.InputCost = cost.InputCost
@@ -5901,6 +6060,9 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	} else if result.ImageCount > 0 {
 		billingMode := string(BillingModeImage)
 		usageLog.BillingMode = &billingMode
+	} else if result.BillableDurationSeconds > 0 {
+		billingMode := string(BillingModeDuration)
+		usageLog.BillingMode = &billingMode
 	} else {
 		billingMode := string(BillingModeToken)
 		usageLog.BillingMode = &billingMode
@@ -5923,7 +6085,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	}
 
 	// 计算账号统计定价费用（使用最终上游模型匹配自定义规则）
-	if apiKey.GroupID != nil {
+	if apiKey.GroupID != nil && cost != nil {
 		applyAccountStatsCost(ctx, usageLog, s.channelService, s.billingService,
 			account.ID, *apiKey.GroupID, result.UpstreamModel, result.Model,
 			tokens, cost.TotalCost,
@@ -5972,6 +6134,25 @@ func (s *OpenAIGatewayService) calculateOpenAIRecordUsageCost(
 	serviceTier string,
 ) (*CostBreakdown, error) {
 	billingModel := firstUsageBillingModel(billingModels)
+	if result != nil && result.BillableDurationSeconds > 0 {
+		if len(billingModels) == 0 || billingModel == "" {
+			return nil, errors.New("openai duration billing model is empty")
+		}
+		resolved := s.resolveOpenAIAudioDurationPricing(ctx, groupIDFromAPIKey(apiKey), billingModel)
+		if resolved == nil || resolved.Mode != BillingModeDuration {
+			return nil, fmt.Errorf("duration pricing is required for model: %s: %w", billingModel, ErrModelPricingUnavailable)
+		}
+		return s.billingService.CalculateCostUnified(CostInput{
+			Ctx:             ctx,
+			Model:           billingModel,
+			GroupID:         groupIDFromAPIKey(apiKey),
+			RequestCount:    1,
+			DurationSeconds: result.BillableDurationSeconds,
+			RateMultiplier:  multiplier,
+			Resolver:        s.resolver,
+			Resolved:        resolved,
+		})
+	}
 	if result != nil && result.ImageCount > 0 {
 		// 渠道定价为 token 计费时走 token 路径，否则走图片计费
 		if resolved := s.resolveOpenAIChannelPricing(ctx, billingModel, apiKey); resolved == nil || resolved.Mode != BillingModeToken {

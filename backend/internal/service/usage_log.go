@@ -110,7 +110,7 @@ type UsageLog struct {
 	ModelMappingChain *string
 	// BillingTier 计费层级标签（per_request/image 模式）
 	BillingTier *string
-	// BillingMode 计费模式：token/image
+	// BillingMode 计费模式：token/image/duration
 	BillingMode *string
 	// ServiceTier records the OpenAI service tier used for billing, e.g. "priority" / "flex".
 	ServiceTier *string
@@ -162,13 +162,14 @@ type UsageLog struct {
 	CacheTTLOverridden bool
 
 	// 图片生成字段
-	ImageCount         int
-	ImageSize          *string
-	ImageInputSize     *string
-	ImageOutputSize    *string
-	ImageSizeSource    *string
-	ImageSizeBreakdown map[string]int
-	MediaType          *string
+	ImageCount              int
+	BillableDurationSeconds int
+	ImageSize               *string
+	ImageInputSize          *string
+	ImageOutputSize         *string
+	ImageSizeSource         *string
+	ImageSizeBreakdown      map[string]int
+	MediaType               *string
 
 	CreatedAt time.Time
 
